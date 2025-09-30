@@ -1,32 +1,52 @@
-from PyQt6.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox
-from PyQt6.QtGui import QPixmap, QImage
-from view import Ui_Dialog
-from PIL import Image, ImageQt
-from inference import get_model
+from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QMessageBox, QDialogButtonBox
+from PySide6.QtGui import QPixmap, QImage
+from view import Ui_MainWindow
+from prediction_modal import PredictionModal
+from contrast_modal import ContrastModal
+from PIL import Image
+from PIL.ImageQt import ImageQt 
+from osgeo import gdal, ogr
+from skimage.exposure import rescale_intensity
 import numpy as np
-import cv2
 import sys
-from ultralytics import YOLO
+import time
+import datetime
 
 class MainWindow(QMainWindow):
-    model = None
+    DEFAULT_CONTRAST_VALUE = 97e4
 
     def __init__(self):
         super(MainWindow, self).__init__()
 
+        self.image = None
+        self.predicted_mask = None
+        self.is_tiff = False
+
         self.init_ui()
+
+        self.prediction_modal = PredictionModal(self)
+        self.contrast_modal = ContrastModal(self)
+        self.contrast_value = self.DEFAULT_CONTRAST_VALUE
         
 
     def init_ui(self):
-        self.ui = Ui_Dialog()
+        self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
         self.ui.label.setText('')
+        self.setWindowTitle("Детектор айсбергов")
+
+        self.ui.findIcebergsButton.setEnabled(False)
+        self.ui.contrastMenuButton.setEnabled(False)
+        self.update_save_buttons(False)
 
         self.add_listeners()
 
     def add_listeners(self):
-        self.ui.pushButton.clicked.connect(self.open_file_dialog)
-        self.ui.pushButton_2.clicked.connect(self.predict)
+        self.ui.selectFileButton.clicked.connect(self.open_file_dialog)
+        self.ui.findIcebergsButton.clicked.connect(self.open_modal)
+        self.ui.contrastMenuButton.clicked.connect(self.open_contrast_modal)
+        self.ui.saveShpButton.clicked.connect(self.save_shp_button_click)
+        self.ui.saveTiffButton.clicked.connect(self.save_tiff_button_click)
 
     def open_file_dialog(self):
         file_dialog = QFileDialog(self)
@@ -35,79 +55,175 @@ class MainWindow(QMainWindow):
         file_dialog.setViewMode(QFileDialog.ViewMode.Detail)
         file_dialog.setNameFilter("Image files (*.png *.tif *.tiff *.jpg)")
 
-        if file_dialog.exec():
-            selected_files = file_dialog.selectedFiles()
-            self.load_image(selected_files[0])
+        self.ui.statusbar.showMessage("Загрузка изображения...")
+
+        if file_dialog.exec():            
+            selected_image = file_dialog.selectedFiles()[0]
+            self.is_tiff = selected_image.endswith(".tiff") or selected_image.endswith(".tif")
+            if self.is_tiff:
+                self.load_tiff(selected_image)
+            else:
+                self.load_image(selected_image)                        
+        
+        self.ui.findIcebergsButton.setEnabled(True)
+        self.ui.contrastMenuButton.setEnabled(True)
+        self.update_save_buttons(False)
+        self.ui.statusbar.clearMessage()
 
     def load_image(self, img_path):
-        image = Image.open(img_path)
+        PIL_image = Image.open(img_path)
+        self.image = np.asarray(PIL_image)
         self.pixmap = QPixmap(img_path)
         self.ui.label.setPixmap(self.pixmap)
 
-    def predict(self):
-        if not self.model:
-            self.model = YOLO("D:\snap data\yolov12s\yolo11m.pt")
+    def load_tiff(self, img_path):
+        tif_img = self.open_tif_as_png(img_path)
+        self.tif_image = tif_img
+        corrected_img = self.contrast_correction(tif_img, 0, self.contrast_value)
+        self.contrast_modal.ui.contrastSlider.setValue(self.contrast_value)
+        self.set_img_fromarray(corrected_img)
 
-        self.inference_img_roboflow()
-
-    def inference_img_roboflow(self):
-        if not self.pixmap:
-            raise Exception("Image not loaded")
-
-        image = ImageQt.fromqimage(self.pixmap)
-        image = np.asarray(image)
-
-        if len(image.shape) != 3:
-            image = np.stack((image,)*3, axis=-1)
-
-        results = self.model.infer(image)[0]
-
-        box_image = image.copy()
-
-        msgBox = QMessageBox()
-        msgBox.setText(f"Найдено айсбергов: {len(results.predictions)}")
-        msgBox.exec()
-
-        for box in results.predictions:            
-
-            x1 = box.x - box.width/2
-            y1 = box.y - box.height/2
-            x2 = box.x + box.width/2
-            y2 = box.y + box.height/2
-
-            print(x1, '-', y1, ' ', x2, '-', y2)
-
-            x1 = int(x1)
-            y1 = int(y1)
-            x2 = int(x2)
-            y2 = int(y2)
-
-            score = box.confidence
-            label = box.class_name
-
-            color = self.map_color_to_prob(score * 100)
-            cv2.rectangle(box_image, (x1, y1), (x2,y2), color, 2)
-            print(f'{score:.2f} {label}')
-            # cv2.putText(box_image, f'{score:.2f}', (x1-50, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-        
-        height, width, channel = box_image.shape
-        bytesPerLine = 3 * width
-        qImg = QImage(box_image.data, width, height, bytesPerLine, QImage.Format.Format_RGB888)
-
-        self.pixmap = QPixmap.fromImage(qImg)
+    def set_img_fromarray(self, img_array):
+        self.image = img_array
+        PIL_image = Image.fromarray(img_array)
+        self.pixmap = QPixmap.fromImage(ImageQt(PIL_image))
         self.ui.label.setPixmap(self.pixmap)
 
-    def map_color_to_prob(self, prob_value):
-        if(prob_value > 45):
-            return (0, 255, 0)
-        if(prob_value > 30 and prob_value <= 45):
-            return (181, 255, 0)
-        if(prob_value > 15 and prob_value <= 30):
-            return (255, 189, 0)
-        if(prob_value > 5 and prob_value <= 15):
-            return (255, 111, 0)
-        if(prob_value > 0 and prob_value <= 5):
-            return (255, 0, 0)
+    def update_contrast(self, value):
+        self.contrast_value = value
+        corrected_img = self.contrast_correction(self.tif_image, 0, value)
+        self.set_img_fromarray(corrected_img)
+
+    def open_modal(self):
+        self.prediction_modal.show()
+        self.prediction_modal.ui.buttonBox.button(QDialogButtonBox.Ok).setEnabled(True)
+        self.prediction_modal.ui.progressBar.setVisible(False)
+
+    def open_contrast_modal(self):
+        self.contrast_modal.ui.contrastSlider.setValue(self.contrast_value)
+        self.contrast_modal.show()        
+
+    def update_save_buttons(self, value):
+        if value:
+            value = self.is_tiff        
+        self.ui.saveShpButton.setEnabled(value)
+        self.ui.saveTiffButton.setEnabled(value)        
+        
+    def open_tif_as_png(self, img_path):
+        dataset = gdal.Open(img_path)
+
+        self.geo_transform = dataset.GetGeoTransform()
+        self.projection = dataset.GetProjection()
+
+        band = dataset.GetRasterBand(1)    
+        data = band.ReadAsArray()
+        data_masked = np.ma.masked_array(data, np.isnan(data)) 
+
+        return data_masked
+        
+    def contrast_correction(self, image, min, max):
+        contrasted = rescale_intensity(image, in_range=(min, max), out_range=(0, 1))
+
+        data_min = np.min(contrasted)
+        data_max = np.max(contrasted)
+        normalized_data = 255 * (contrasted - data_min) / (data_max - data_min)
+        normalized_data = normalized_data.astype(np.uint8) 
+
+        return normalized_data
+    
+    def save_shp_button_click(self):
+        file_dialog = QFileDialog(self)
+        file_dialog.setWindowTitle("Открыть папку")
+        file_dialog.setFileMode(QFileDialog.FileMode.Directory)
+        file_dialog.setViewMode(QFileDialog.ViewMode.Detail)
+
+        if file_dialog.exec():
+            path = file_dialog.selectedFiles()[0]
+            self.save_to_shapefile(path)
+
+    def save_tiff_button_click(self):
+        file_dialog = QFileDialog(self)
+        file_dialog.setWindowTitle("Открыть папку")
+        file_dialog.setFileMode(QFileDialog.FileMode.Directory)
+        file_dialog.setViewMode(QFileDialog.ViewMode.Detail)
+
+        if file_dialog.exec():
+            path = file_dialog.selectedFiles()[0]
+            self.save_to_tiff(path)
+    
+    def save_to_tiff(self, out_path):
+        width, height = self.image.shape[1], self.image.shape[0]
+
+        ts = time.time()
+        timestamp = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d_%H%M%S')
+        out_path += f"/predicted_{timestamp}.tif"
+
+        driver = gdal.GetDriverByName("GTiff")
+        out_dataset = driver.Create(
+            out_path,
+            width,
+            height,
+            3,
+            gdal.GDT_Byte
+        )
+
+        for i, band in enumerate(np.moveaxis(self.image, -1, 0)):
+            out_dataset.GetRasterBand(i + 1).WriteArray(band)
+
+        out_dataset.SetGeoTransform(self.geo_transform)
+        out_dataset.SetProjection(self.projection)
+
+        out_dataset = None
+
+    def save_to_shapefile(self, out_path):
+        width, height = self.predicted_mask.shape[1], self.predicted_mask.shape[0]
+
+        ts = time.time()
+        timestamp = datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d_%H%M%S')
+        out_path += f"/predicted_{timestamp}.shp"
+
+        print(out_path)
+
+        driver = gdal.GetDriverByName("MEM")
+        dataset = driver.Create(
+            '',
+            width,
+            height,
+            3,
+            gdal.GDT_Byte
+        )
+
+        band = np.moveaxis(self.predicted_mask, -1, 0)[0]
+        dataset.GetRasterBand(1).WriteArray(band)
+
+        dataset.SetGeoTransform(self.geo_transform)
+        dataset.SetProjection(self.projection)
+
+        srcband = dataset.GetRasterBand(1)
+        dst_layername = 'icebergs'
+        drv = ogr.GetDriverByName("ESRI Shapefile")
+        dst_ds = drv.CreateDataSource(out_path)
+
+        sp_ref = dataset.GetSpatialRef()
+
+        dst_layer = dst_ds.CreateLayer(dst_layername, srs = sp_ref )    
+
+        fld = ogr.FieldDefn("Score", ogr.OFTInteger)
+        dst_layer.CreateField(fld)    
+
+        gdal.Polygonize( srcband, None, dst_layer, 0, [], callback=None )
+        
+        to_remove = []
+        for i in range(dst_layer.GetFeatureCount()):
+            feature = dst_layer.GetFeature(i)
+            if feature.GetField("Score") == 0:
+                to_remove.append(feature.GetFID())
+        
+        for fid in sorted(to_remove, reverse=True):
+            dst_layer.DeleteFeature(fid)
+
+        del dataset
+        del dst_ds
         
 
 if __name__ == "__main__":
